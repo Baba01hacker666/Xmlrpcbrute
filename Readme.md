@@ -1,6 +1,13 @@
-XML-RPC WordPress Authentication Testing Tool
-Author: baba01hacker
+#XML-RPC WordPress Authentication 
+Testing Tool
+
+
+#Author: baba01hacker
+
+
 Version: 2.0
+
+
 Purpose: Security assessment of WordPress XML-RPC endpoints
 Features
 ✅ User Enumeration - Detect valid usernames via XML-RPC error messages
