@@ -1,8 +1,8 @@
-#XML-RPC WordPress Authentication 
+# XML-RPC WordPress Authentication
 Testing Tool
 
 
-#Author: baba01hacker
+# Author: baba01hacker
 
 
 Version: 2.0
